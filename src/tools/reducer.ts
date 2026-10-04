@@ -1,0 +1,449 @@
+import { ToolArtifactStore } from "./artifact-store.js";
+
+export interface ReducerConfig {
+  enabled: boolean;
+  grep: {
+    maxTotalLines: number;
+    maxMatchesPerFile: number;
+    maxLineLength: number;
+    maxOutputChars: number;
+  };
+  read: {
+    maxOutlineLines: number;
+    maxSliceLines: number;
+    maxPreviewLines: number;
+    maxOutputChars: number;
+  };
+  bash: {
+    maxTotalLines: number;
+    maxErrorBlockLines: number;
+    maxTrailingLines: number;
+    maxOutputChars: number;
+    dedupeConsecutiveLines: boolean;
+  };
+  webFetch: {
+    maxChars: number;
+    maxHeadingChars: number;
+  };
+}
+
+export const DEFAULT_REDUCER_CONFIG: ReducerConfig = {
+  enabled: true,
+  grep: {
+    maxTotalLines: 50,
+    maxMatchesPerFile: 3,
+    maxLineLength: 200,
+    maxOutputChars: 3000,
+  },
+  read: {
+    maxOutlineLines: 60,
+    maxSliceLines: 200,
+    maxPreviewLines: 30,
+    maxOutputChars: 4000,
+  },
+  bash: {
+    maxTotalLines: 40,
+    maxErrorBlockLines: 20,
+    maxTrailingLines: 20,
+    maxOutputChars: 4000,
+    dedupeConsecutiveLines: true,
+  },
+  webFetch: {
+    maxChars: 2000,
+    maxHeadingChars: 500,
+  },
+};
+
+export interface ReducedOutput {
+  content: string;
+  rawBytes: number;
+  reducedBytes: number;
+  artifactId: string;
+}
+
+/** Main entry: reduce raw tool output, store raw artifact, return reduced form. */
+export function reduceToolOutput(
+  toolName: string,
+  raw: string,
+  args: Record<string, unknown>,
+  store: ToolArtifactStore,
+  config: ReducerConfig = DEFAULT_REDUCER_CONFIG,
+): ReducedOutput {
+  const rawBytes = Buffer.byteLength(raw, "utf8");
+  const artifactId = store.store(raw);
+
+  if (!config.enabled) {
+    return { content: raw, rawBytes, reducedBytes: rawBytes, artifactId };
+  }
+
+  let reduced: string;
+  let wasReduced = false;
+  let hint: string | undefined;
+
+  switch (toolName) {
+    case "grep": {
+      const r = reduceGrep(raw, args, config.grep);
+      reduced = r.body;
+      wasReduced = r.wasReduced;
+      hint = r.hint;
+      break;
+    }
+    case "read": {
+      const r = reduceRead(raw, args, config.read);
+      reduced = r.body;
+      wasReduced = r.wasReduced;
+      hint = r.hint;
+      break;
+    }
+    case "bash": {
+      const r = reduceBash(raw, args, config.bash);
+      reduced = r.body;
+      wasReduced = r.wasReduced;
+      hint = r.hint;
+      break;
+    }
+    case "web_fetch": {
+      const r = reduceWebFetch(raw, args, config.webFetch);
+      reduced = r.body;
+      wasReduced = r.wasReduced;
+      hint = r.hint;
+      break;
+    }
+    default:
+      reduced = raw;
+      break;
+  }
+
+  if (!wasReduced) {
+    return { content: reduced, rawBytes, reducedBytes: rawBytes, artifactId };
+  }
+
+  const footer = `[output reduced — full raw stored as artifact ${artifactId}]`;
+  const content = hint ? `${reduced}\n${footer}\n${hint}` : `${reduced}\n${footer}`;
+  const reducedBytes = Buffer.byteLength(content, "utf8");
+  return { content, rawBytes, reducedBytes, artifactId };
+}
+
+// ─── Grep ────────────────────────────────────────────────────────────────────
+
+interface GrepMatch {
+  file: string;
+  line: number;
+  text: string;
+}
+
+function parseGrepLines(raw: string): GrepMatch[] {
+  const matches: GrepMatch[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // ripgrep format: file:line:text  or  file:text (if no line numbers)
+    const m = trimmed.match(/^(.+?):(\d+)?:(.*)$/);
+    if (m) {
+      matches.push({ file: m[1]!, line: m[2] ? parseInt(m[2], 10) : 0, text: m[3]! });
+    } else {
+      // files-only mode or plain path
+      matches.push({ file: trimmed, line: 0, text: "" });
+    }
+  }
+  return matches;
+}
+
+interface ReduceResult {
+  body: string;
+  wasReduced: boolean;
+  hint?: string;
+}
+
+function reduceGrep(raw: string, args: Record<string, unknown>, cfg: ReducerConfig["grep"]): ReduceResult {
+  const isFilesMode = args.output_mode === "files";
+  const matches = parseGrepLines(raw);
+
+  if (matches.length === 0) {
+    return { body: raw, wasReduced: false };
+  }
+
+  // Files-only mode: reformat as count + list (always considered reduced)
+  if (isFilesMode) {
+    const files = [...new Set(matches.map((m) => m.file))];
+    const lines = [`${files.length} file(s) matched:`, ...files];
+    return {
+      body: lines.join("\n"),
+      wasReduced: true,
+      hint: "Re-run with output_mode=\"content\" for match details.",
+    };
+  }
+
+  // Group by file
+  const byFile = new Map<string, GrepMatch[]>();
+  for (const m of matches) {
+    const list = byFile.get(m.file) ?? [];
+    list.push(m);
+    byFile.set(m.file, list);
+  }
+
+  const lines: string[] = [];
+  let totalShown = 0;
+  const totalHits = matches.length;
+  const fileCount = byFile.size;
+
+  lines.push(`Matched ${fileCount} file(s) (${totalHits} total hits):`);
+
+  for (const [file, hits] of byFile) {
+    if (totalShown >= cfg.maxTotalLines) break;
+    lines.push(`  ${file}: ${hits.length} hit(s)`);
+    const toShow = Math.min(hits.length, cfg.maxMatchesPerFile);
+    for (let i = 0; i < toShow; i++) {
+      const h = hits[i]!;
+      const text = h.text.length > cfg.maxLineLength ? h.text.slice(0, cfg.maxLineLength) + "…" : h.text;
+      const prefix = h.line > 0 ? `    ${h.line}:` : "    ";
+      lines.push(`${prefix}${text}`);
+      totalShown++;
+      if (totalShown >= cfg.maxTotalLines) break;
+    }
+  }
+
+  if (totalShown < totalHits) {
+    lines.push(`  … (${totalHits - totalShown} more hits omitted)`);
+  }
+
+  return {
+    body: lines.join("\n"),
+    wasReduced: totalHits > totalShown || fileCount > 1,
+    hint: "Use expand_artifact for full matches, or re-run with output_mode=\"files\" for paths only.",
+  };
+}
+
+// ─── Read ────────────────────────────────────────────────────────────────────
+
+function reduceRead(raw: string, args: Record<string, unknown>, cfg: ReducerConfig["read"]): ReduceResult {
+  // If user explicitly requested a slice, respect it (but still cap)
+  const hasSlice = typeof args.offset === "number" || typeof args.limit === "number";
+  if (hasSlice) {
+    const lines = raw.split("\n");
+    if (lines.length > cfg.maxSliceLines) {
+      const kept = lines.slice(0, cfg.maxSliceLines).join("\n");
+      return {
+        body: kept,
+        wasReduced: true,
+        hint: `… (${lines.length - cfg.maxSliceLines} more lines omitted)`,
+      };
+    }
+    return { body: raw, wasReduced: false };
+  }
+
+  // Full file: produce structure outline
+  const allLines = raw.split("\n");
+  const totalLines = allLines.length;
+
+  // Strip line numbers for parsing (format: "  1\tcontent" or "1\tcontent")
+  const cleanLines = allLines.map((l) => l.replace(/^\s*\d+\t/, ""));
+
+  const imports: string[] = [];
+  const exports: string[] = [];
+  const functions: string[] = [];
+  const classes: string[] = [];
+
+  for (let i = 0; i < cleanLines.length; i++) {
+    const line = cleanLines[i]!;
+    const lineNum = i + 1;
+    if (/^import\s+/.test(line)) {
+      imports.push(`${lineNum}: ${line.trim()}`);
+    } else if (/^(?:export\s+)?class\s+\w+/.test(line)) {
+      classes.push(`${lineNum}: ${line.trim()}`);
+    } else if (/^export\s+/.test(line)) {
+      exports.push(`${lineNum}: ${line.trim()}`);
+    } else if (/^(?:async\s+)?function\s+\w+/.test(line)) {
+      functions.push(`${lineNum}: ${line.trim()}`);
+    }
+  }
+
+  const parts: string[] = [];
+  parts.push(`File: ${totalLines} lines total`);
+
+  if (imports.length > 0) {
+    parts.push(`\nImports (${imports.length}):`);
+    parts.push(...imports.slice(0, Math.floor(cfg.maxOutlineLines / 4)));
+  }
+  if (exports.length > 0) {
+    parts.push(`\nExports (${exports.length}):`);
+    parts.push(...exports.slice(0, Math.floor(cfg.maxOutlineLines / 4)));
+  }
+  if (functions.length > 0) {
+    parts.push(`\nFunctions (${functions.length}):`);
+    parts.push(...functions.slice(0, Math.floor(cfg.maxOutlineLines / 4)));
+  }
+  if (classes.length > 0) {
+    parts.push(`\nClasses (${classes.length}):`);
+    parts.push(...classes.slice(0, Math.floor(cfg.maxOutlineLines / 4)));
+  }
+
+  // Preview first N lines
+  const previewCount = Math.min(cfg.maxPreviewLines, totalLines);
+  parts.push(`\nPreview (lines 1–${previewCount}):`);
+  parts.push(...allLines.slice(0, previewCount));
+
+  return {
+    body: parts.join("\n"),
+    wasReduced: true,
+    hint: "Use expand_artifact for full file, or read with offset/limit for a specific slice.",
+  };
+}
+
+// ─── Bash ────────────────────────────────────────────────────────────────────
+
+function reduceBash(raw: string, _args: Record<string, unknown>, cfg: ReducerConfig["bash"]): ReduceResult {
+  const lines = raw.split("\n");
+  if (lines.length <= cfg.maxTotalLines) {
+    return { body: raw, wasReduced: false };
+  }
+
+  // Parse header (first line usually contains exit=... or timeout)
+  let header = "";
+  let bodyStart = 0;
+  if (lines[0]?.startsWith("exit=") || lines[0]?.startsWith("(timed out")) {
+    header = lines[0]!;
+    bodyStart = 1;
+  }
+
+  const body = lines.slice(bodyStart);
+
+  // Determine if this looks like a failure
+  const isFailure = header.includes("exit=1") ||
+    raw.includes("Error:") ||
+    raw.includes("error:") ||
+    raw.includes("FAIL") ||
+    raw.includes("failed");
+
+  const out: string[] = [header];
+
+  if (isFailure) {
+    // Extract error block: lines near errors or stack traces
+    const errorIndices: number[] = [];
+    for (let i = 0; i < body.length; i++) {
+      const line = body[i]!;
+      if (
+        /\bError\b/i.test(line) ||
+        /\berror\b/i.test(line) ||
+        /\bFAIL\b/i.test(line) ||
+        /\bfailed\b/i.test(line) ||
+        /^\s+at\s+/.test(line) ||
+        /\s+Error:\s+/.test(line)
+      ) {
+        // Grab a window around the error
+        for (let j = Math.max(0, i - 2); j <= Math.min(body.length - 1, i + 2); j++) {
+          if (!errorIndices.includes(j)) errorIndices.push(j);
+        }
+      }
+    }
+
+    // Sort and cap error block
+    errorIndices.sort((a, b) => a - b);
+    const cappedError = errorIndices.slice(0, cfg.maxErrorBlockLines);
+    if (cappedError.length > 0) {
+      out.push("--- error block ---");
+      for (const idx of cappedError) {
+        out.push(body[idx]!);
+      }
+    }
+
+    // Extract failing test names
+    const testNames: string[] = [];
+    for (const line of body) {
+      const m = line.match(/(?:✗|✕|×|FAIL)\s+(.+)/) ||
+        line.match(/failing\s*\d*\s*:?\s*(.+)/i) ||
+        line.match(/Test\s+\w+\s+failed/i);
+      if (m && m[1]) {
+        const name = m[1].trim().slice(0, 120);
+        if (!testNames.includes(name)) testNames.push(name);
+      }
+    }
+    if (testNames.length > 0) {
+      out.push("--- failing tests ---");
+      out.push(...testNames.slice(0, 10));
+    }
+  }
+
+  // Last N relevant lines
+  const trailing = body.slice(-cfg.maxTrailingLines);
+  out.push("--- last lines ---");
+  out.push(...trailing);
+
+  // Deduplicate consecutive repeated lines if enabled
+  let result = out.join("\n");
+  if (cfg.dedupeConsecutiveLines) {
+    result = dedupeConsecutive(result);
+  }
+
+  return {
+    body: result,
+    wasReduced: true,
+    hint: "Use expand_artifact for full output.",
+  };
+}
+
+function dedupeConsecutive(text: string): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  let repeatCount = 1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const next = lines[i + 1];
+    if (next !== undefined && next === line) {
+      repeatCount++;
+      continue;
+    }
+    if (repeatCount > 2) {
+      out.push(line);
+      out.push(`… (${repeatCount - 1} identical lines omitted)`);
+    } else {
+      for (let j = 0; j < repeatCount; j++) {
+        out.push(line);
+      }
+    }
+    repeatCount = 1;
+  }
+  return out.join("\n");
+}
+
+// ─── Web Fetch ───────────────────────────────────────────────────────────────
+
+function reduceWebFetch(raw: string, args: Record<string, unknown>, cfg: ReducerConfig["webFetch"]): ReduceResult {
+  const url = typeof args.url === "string" ? args.url : "(unknown URL)";
+
+  // Extract title from first heading
+  const titleMatch = raw.match(/^#\s+(.+)$/m);
+  const title = titleMatch ? titleMatch[1]!.trim() : "(no title)";
+
+  const parts: string[] = [];
+  parts.push(`Title: ${title}`);
+  parts.push(`URL: ${url}`);
+
+  // Extract headings for a mini TOC
+  const headings = raw.match(/^#{1,3}\s+.+$/gm) ?? [];
+  if (headings.length > 0) {
+    parts.push("\nSections:");
+    for (const h of headings.slice(0, 10)) {
+      parts.push(`  ${h}`);
+    }
+  }
+
+  // First N chars of body
+  const bodyStart = raw.indexOf("\n\n");
+  const body = bodyStart > 0 ? raw.slice(bodyStart + 2) : raw;
+  const excerpt = body.slice(0, cfg.maxChars).trim();
+  if (excerpt) {
+    parts.push(`\nExcerpt (${excerpt.length} chars):`);
+    parts.push(excerpt);
+  }
+
+  if (body.length > cfg.maxChars) {
+    parts.push(`\n… (${body.length - cfg.maxChars} more chars omitted)`);
+  }
+
+  return {
+    body: parts.join("\n"),
+    wasReduced: true,
+    hint: "Use expand_artifact for full page content.",
+  };
+}

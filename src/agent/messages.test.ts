@@ -1,0 +1,110 @@
+import { describe, it } from "node:test";
+import assert from "node:assert";
+import { stableStringify, stripOldImages } from "./messages.js";
+import type { ChatMessage } from "./messages.js";
+
+describe("stableStringify", () => {
+  it("produces identical strings for objects with different key insertion orders", () => {
+    const a = { z: 1, a: 2, m: 3 };
+    const b = { a: 2, m: 3, z: 1 };
+    assert.strictEqual(stableStringify(a), stableStringify(b));
+  });
+
+  it("handles nested objects", () => {
+    const a = { outer: { z: 1, a: 2 } };
+    const b = { outer: { a: 2, z: 1 } };
+    assert.strictEqual(stableStringify(a), stableStringify(b));
+  });
+
+  it("handles arrays consistently", () => {
+    const a = [{ z: 1 }, { a: 2 }];
+    const b = [{ z: 1 }, { a: 2 }];
+    assert.strictEqual(stableStringify(a), stableStringify(b));
+  });
+
+  it("differs when values differ", () => {
+    const a = { x: 1 };
+    const b = { x: 2 };
+    assert.notStrictEqual(stableStringify(a), stableStringify(b));
+  });
+
+  it("works with a replacer", () => {
+    const obj = { a: "hello", b: 42 };
+    const result = stableStringify(obj, (_k, v) => (typeof v === "string" ? v.toUpperCase() : v));
+    assert.ok(result.includes("HELLO"));
+  });
+
+  it("works with indentation", () => {
+    const obj = { a: 1 };
+    const result = stableStringify(obj, undefined, 2);
+    assert.ok(result.includes("\n"));
+  });
+});
+
+describe("stripOldImages", () => {
+  const img = (url: string) => ({ type: "image_url" as const, image_url: { url } });
+  const txt = (text: string) => ({ type: "text" as const, text });
+
+  it("keeps images in recent turns", () => {
+    const messages: ChatMessage[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: [txt("old"), img("http://old")] },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: [txt("new"), img("http://new")] },
+    ];
+    const result = stripOldImages(messages, 1);
+    assert.deepStrictEqual((result[1]!.content as typeof messages[0]["content"])!, [txt("old")]);
+    assert.deepStrictEqual((result[3]!.content as typeof messages[0]["content"])!, [txt("new"), img("http://new")]);
+  });
+
+  it("strips images from older turns while keeping text", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: [txt("a"), img("http://a")] },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: [txt("b"), img("http://b")] },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: [txt("c"), img("http://c")] },
+    ];
+    const result = stripOldImages(messages, 2);
+    assert.deepStrictEqual((result[0]!.content as typeof messages[0]["content"])!, [txt("a")]);
+    assert.deepStrictEqual((result[2]!.content as typeof messages[0]["content"])!, [txt("b"), img("http://b")]);
+    assert.deepStrictEqual((result[4]!.content as typeof messages[0]["content"])!, [txt("c"), img("http://c")]);
+  });
+
+  it("leaves string-only messages untouched", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi" },
+    ];
+    const result = stripOldImages(messages, 1);
+    assert.strictEqual(result[0]!.content, "hello");
+  });
+
+  it("replaces image-only messages with fallback text", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: [img("http://x")] },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: [img("http://y")] },
+    ];
+    const result = stripOldImages(messages, 1);
+    assert.strictEqual(result[0]!.content, "[image omitted]");
+    assert.deepStrictEqual((result[2]!.content as typeof messages[0]["content"])!, [img("http://y")]);
+  });
+
+  it("does not mutate the original array", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: [txt("a"), img("http://a")] },
+    ];
+    const original = JSON.stringify(messages);
+    stripOldImages(messages, 0);
+    assert.strictEqual(JSON.stringify(messages), original);
+  });
+
+  it("returns input unchanged when keepLastTurns is negative", () => {
+    const messages: ChatMessage[] = [
+      { role: "user", content: [img("http://a")] },
+    ];
+    const result = stripOldImages(messages, -1);
+    assert.deepStrictEqual((result[0]!.content as typeof messages[0]["content"])!, [img("http://a")]);
+  });
+});

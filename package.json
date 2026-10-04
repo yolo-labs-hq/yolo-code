@@ -1,0 +1,74 @@
+{
+  "name": "yolo-code",
+  "version": "0.14.0",
+  "description": "YOLO Code — a terminal coding agent for YOLO Studio. Forked from kimiflare; powered by Kimi-K2.6 on Cloudflare Workers AI with image understanding, plan mode, MCP integration, and a 262k context window.",
+  "keywords": [
+    "ai",
+    "cli",
+    "coding-agent",
+    "terminal",
+    "yolo",
+    "yolo-studio",
+    "kimi",
+    "k2.6",
+    "cloudflare",
+    "workers-ai",
+    "vision",
+    "image-understanding",
+    "llm",
+    "code-generation",
+    "tui",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yolo-labs-hq/yolo-code.git"
+  },
+  "homepage": "https://github.com/yolo-labs-hq/yolo-code#readme",
+  "bugs": "https://github.com/yolo-labs-hq/yolo-code/issues",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "yolo-code": "bin/yolo-code.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "build:bundle": "tsup --config tsup.bundle.config.ts",
+    "dev": "tsx src/index.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts src/*/*.test.ts",
+    "start": "node bin/yolo-code.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "commander": "^12.1.0",
+    "diff": "^7.0.0",
+    "fast-glob": "^3.3.2",
+    "ink": "^7.0.1",
+    "ink-select-input": "^6.2.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0",
+    "react-devtools-core": "^6.1.2",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.0",
+    "@types/node": "^22.9.0",
+    "@types/react": "^19.2.0",
+    "@types/turndown": "^5.0.5",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
